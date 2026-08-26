@@ -11,3 +11,6 @@ from .risk_score import RiskScore
 from .fraud_alert import FraudAlert
 from .payment import Payment
 from .audit_log import AuditLog
+from .approval import ApprovalRequest, ApprovalAction
+from .approval_policy import ApprovalPolicy
+from .notification import Notification

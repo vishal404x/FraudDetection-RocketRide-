@@ -23,6 +23,20 @@ def get_payment(payment_id: int, current_user: models.User = Depends(get_current
         raise HTTPException(status_code=404, detail='Payment not found')
     return {'id': p.id, 'invoice_id': p.invoice_id, 'amount': float(p.amount), 'currency': p.currency, 'status': p.status, 'held': p.held, 'reason': p.reason}
 
+@router.post('/')
+def create_payment_endpoint(payload: dict, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # who can create payments? Allow AP Specialist and above
+    require_role(current_user, ['Owner', 'Admin', 'Finance Manager', 'AP Specialist'])
+    invoice_id = payload.get('invoice_id')
+    amount = payload.get('amount')
+    currency = payload.get('currency', 'INR')
+    if not amount:
+        raise HTTPException(status_code=400, detail='amount required')
+    payment = crud.create_payment(db, current_user.organization_id, invoice_id, amount, currency)
+    # create audit log for creation
+    crud.create_audit_log(db, current_user.organization_id, current_user.id, action='PAYMENT_CREATED', object_type='payment', object_id=payment.id, previous_state=None, new_state=payment.status, reason=payload.get('reason'))
+    return {'id': payment.id, 'status': payment.status}
+
 @router.post('/{payment_id}/hold')
 def hold_payment(payment_id: int, reason: dict, current_user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
     org_id = current_user.organization_id
@@ -47,6 +61,11 @@ def release_payment(payment_id: int, payload: dict, current_user: models.User = 
     payment = db.query(models.Payment).filter(models.Payment.id == payment_id, models.Payment.organization_id == org_id).first()
     if not payment:
         raise HTTPException(status_code=404, detail='Payment not found')
+    # check for approval requests
+    apr = crud.get_approval_for_payment(db, payment.id)
+    if apr and not crud.is_approval_satisfied(db, apr.id):
+        raise HTTPException(status_code=403, detail='Payment requires approval before it can be released')
+
     prev_state = payment.status
     payment.status = 'RELEASED'
     payment.held = 'NO'

@@ -13,7 +13,37 @@ def create_organization(db: Session, name: str):
     db.add(org)
     db.commit()
     db.refresh(org)
+    # create default approval policy for organization
+    try:
+        default_policy = models.ApprovalPolicy(organization_id=org.id, name='default', threshold_amount=500000.0, required_roles=['Finance Manager', 'CFO'])
+        db.add(default_policy)
+        db.commit()
+        db.refresh(default_policy)
+    except Exception:
+        db.rollback()
     return org
+
+
+def get_approval_policy(db: Session, organization_id: int):
+    return db.query(models.ApprovalPolicy).filter(models.ApprovalPolicy.organization_id == organization_id).first()
+
+
+def update_approval_policy(db: Session, organization_id: int, threshold_amount: float | None = None, required_roles: list | None = None):
+    pol = get_approval_policy(db, organization_id)
+    if not pol:
+        pol = models.ApprovalPolicy(organization_id=organization_id, name='default', threshold_amount=(threshold_amount or 500000.0), required_roles=(required_roles or ['Finance Manager', 'CFO']))
+        db.add(pol)
+        db.commit()
+        db.refresh(pol)
+        return pol
+    if threshold_amount is not None:
+        pol.threshold_amount = float(threshold_amount)
+    if required_roles is not None:
+        pol.required_roles = required_roles
+    db.add(pol)
+    db.commit()
+    db.refresh(pol)
+    return pol
 
 def create_user(db: Session, email: str, password: str, organization_id: int, full_name: str | None = None, role: str = 'Viewer', is_superuser: bool = False):
     hashed = pwd_context.hash(password)
@@ -193,6 +223,50 @@ def create_fraud_alert(db: Session, organization_id: int, invoice_id: int | None
     db.refresh(fa)
     return fa
 
+# Payment helper
+def create_payment(db: Session, organization_id: int, invoice_id: int | None, amount: float, currency: str | None = 'INR'):
+    from decimal import Decimal
+    from app.core.config import settings
+    payment = models.Payment(organization_id=organization_id, invoice_id=invoice_id, amount=Decimal(amount), currency=currency, status='PENDING', held='NO')
+    # If invoice is held, hold payment immediately
+    if invoice_id:
+        inv = db.query(models.Invoice).filter(models.Invoice.id == invoice_id).first()
+        if inv and inv.status == 'HELD':
+            payment.status = 'HELD'
+            payment.held = 'YES'
+    # determine approval threshold from org policy if available
+    db.add(payment)
+    db.commit()
+    db.refresh(payment)
+
+    pol = None
+    try:
+        pol = get_approval_policy(db, organization_id)
+    except Exception:
+        pol = None
+
+    if pol:
+        threshold = float(pol.threshold_amount or 500000.0)
+        req_roles = pol.required_roles or ['Finance Manager', 'CFO']
+    else:
+        try:
+            threshold = float(settings.APPROVAL_THRESHOLD)
+        except Exception:
+            threshold = 500000.0
+        req_roles = ['Finance Manager', 'CFO']
+
+    if float(payment.amount) >= threshold:
+        apr = models.ApprovalRequest(organization_id=organization_id, payment_id=payment.id, status='PENDING', required_roles=req_roles)
+        db.add(apr)
+        db.commit()
+        db.refresh(apr)
+        # create notifications for approvers (by role)
+        try:
+            create_notification(db, organization_id=organization_id, user_id=None, target_roles=req_roles, notif_type='APPROVAL_REQUEST_CREATED', message=f'Approval required for payment {payment.id}', metadata={'payment_id': payment.id, 'approval_request_id': apr.id})
+        except Exception:
+            db.rollback()
+    return payment
+
 # Audit logs
 def create_audit_log(db: Session, organization_id: int, user_id: int, action: str, object_type: str | None, object_id: int | None, previous_state: str | None, new_state: str | None, reason: str | None = None, metadata: dict | None = None):
     al = models.AuditLog(organization_id=organization_id, user_id=user_id, action=action, object_type=object_type, object_id=object_id, previous_state=previous_state, new_state=new_state, reason=reason, metadata=metadata)
@@ -200,3 +274,90 @@ def create_audit_log(db: Session, organization_id: int, user_id: int, action: st
     db.commit()
     db.refresh(al)
     return al
+
+# Approval helpers
+
+# Notification helpers
+def create_notification(db: Session, organization_id: int, user_id: int | None, target_roles: list | None, notif_type: str, message: str, metadata: dict | None = None):
+    notif = models.Notification(organization_id=organization_id, user_id=user_id, target_roles=target_roles, notif_type=notif_type, message=message, metadata=metadata)
+    db.add(notif)
+    db.commit()
+    db.refresh(notif)
+    return notif
+
+
+def list_notifications_for_user(db: Session, organization_id: int, user_id: int, user_role: str):
+    # return notifications that are either directly to the user or target the user's role
+    q = db.query(models.Notification).filter(models.Notification.organization_id == organization_id)
+    q = q.filter(((models.Notification.user_id == user_id) | (models.Notification.target_roles != None)))
+    # We'll filter target_roles in Python since JSON matching across DB varies
+    all_notifs = q.order_by(models.Notification.seen.asc(), models.Notification.created_at.desc()).all()
+    out = []
+    for n in all_notifs:
+        if n.user_id == user_id:
+            out.append(n)
+            continue
+        if n.target_roles:
+            try:
+                if user_role in (n.target_roles or []):
+                    out.append(n)
+            except Exception:
+                pass
+    return out
+
+
+def mark_notification_seen(db: Session, notification_id: int, user_id: int | None = None):
+    n = db.query(models.Notification).filter(models.Notification.id == notification_id).first()
+    if not n:
+        return None
+    n.seen = True
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+    return n
+
+
+def get_approval_request(db: Session, approval_id: int):
+    return db.query(models.ApprovalRequest).filter(models.ApprovalRequest.id == approval_id).first()
+
+
+def get_approval_for_payment(db: Session, payment_id: int):
+    return db.query(models.ApprovalRequest).filter(models.ApprovalRequest.payment_id == payment_id).first()
+
+
+def add_approval_action(db: Session, approval_request_id: int, user_id: int, action: str, comment: str | None = None):
+    apr = get_approval_request(db, approval_request_id)
+    if not apr:
+        return None
+    act = models.ApprovalAction(approval_request_id=approval_request_id, user_id=user_id, action=action, comment=comment)
+    db.add(act)
+    # If action is REJECTED, mark request rejected
+    if action == 'REJECTED':
+        apr.status = 'REJECTED'
+    db.commit()
+    db.refresh(act)
+    db.refresh(apr)
+    # If action is APPROVED check if required roles satisfied
+    if action == 'APPROVED':
+        # fetch actions and detect if someone from required_roles approved
+        acts = db.query(models.ApprovalAction).filter(models.ApprovalAction.approval_request_id == approval_request_id).all()
+        approved = False
+        for a in acts:
+            user = db.query(models.User).filter(models.User.id == a.user_id).first()
+            if user and user.role in (apr.required_roles or []):
+                approved = True
+                break
+        if approved:
+            apr.status = 'APPROVED'
+            db.commit()
+            db.refresh(apr)
+    return act
+
+
+def is_approval_satisfied(db: Session, approval_request_id: int) -> bool:
+    apr = get_approval_request(db, approval_request_id)
+    if not apr:
+        return True
+    if apr.status == 'APPROVED':
+        return True
+    return False
